@@ -122,6 +122,7 @@ Argument = Annotated[
 
 
 class Executor(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     name: ExecutorType
     elevation_required: bool = False
 

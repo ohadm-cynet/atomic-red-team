@@ -1,8 +1,12 @@
+import pytest
+from pathlib import Path
 from hypothesis import given, strategies as st, settings, HealthCheck
 from hypothesis.provisional import urls
-from pydantic import AnyUrl
+from pydantic import AnyUrl, ValidationError
 from pydantic.networks import IPvAnyAddress
+from ruamel.yaml import YAML
 
+from atomic_red_team.common import atomics_path
 from atomic_red_team.models import (
     Technique,
     Atomic,
@@ -15,6 +19,33 @@ from atomic_red_team.models import (
     CommandExecutor,
     ExecutorType,
 )
+from atomic_red_team.validator import format_validation_error
+
+yaml = YAML(typ="safe")
+technique_yaml_root = Path(atomics_path)
+min_expected_technique_yaml_files = 300
+technique_yaml_files = sorted(technique_yaml_root.glob("T*/T*.yaml"))
+
+
+def _compact_validation_errors(error: ValidationError):
+    try:
+        formatted_error = format_validation_error(error)
+        return [f"{loc}: {msg}" for msg, loc in formatted_error.items()]
+    except TypeError:
+        # format_validation_error can raise when pydantic errors include unhashable inputs.  # noqa: E501
+        pass
+
+    try:
+        errors = error.errors(include_input=False)
+    except TypeError:
+        errors = error.errors()
+
+    compact_errors = []
+    for issue in errors:
+        loc = ".".join(str(part) for part in issue.get("loc", ()))
+        msg = issue.get("msg", "Validation error")
+        compact_errors.append(f"{loc}: {msg}")
+    return compact_errors
 
 executor_strategy = st.sampled_from(["powershell", "bash", "sh", "command_prompt"])
 
@@ -123,3 +154,49 @@ def test_property(instance):
     for test in instance.atomic_tests:
         assert isinstance(test, Atomic)
         assert test.executor.name in ExecutorType.__args__
+
+
+def test_discovery_finds_expected_technique_yaml_files():
+    assert len(technique_yaml_files) >= min_expected_technique_yaml_files, (
+        f"Expected >= {min_expected_technique_yaml_files} technique YAML files under "  # noqa: E501
+        f"{technique_yaml_root}/T*/T*.yaml, got {len(technique_yaml_files)}. Check discovery glob."  # noqa: E501
+    )
+
+
+@pytest.mark.parametrize(
+    "technique_yaml_file",
+    technique_yaml_files,
+    ids=lambda path: str(path.relative_to(technique_yaml_root)),
+)
+def test_all_technique_yaml_files_parse(technique_yaml_file: Path):
+    with technique_yaml_file.open("r", encoding="utf-8") as stream:
+        data = yaml.load(stream)
+
+    assert isinstance(data, dict), (
+        f"{technique_yaml_file}: expected top-level YAML mapping with "
+        "attack_technique/display_name/atomic_tests keys."
+    )
+
+    try:
+        technique = Technique(**data)
+    except ValidationError as error:
+        compact_errors = _compact_validation_errors(error)
+        pytest.fail(
+            f"{technique_yaml_file}: validation failed\n- "
+            + "\n- ".join(compact_errors)
+        )
+
+    assert technique.attack_technique == technique_yaml_file.stem, (
+        f"{technique_yaml_file}: attack_technique '{technique.attack_technique}' "  # noqa: E501
+        f"does not match filename stem '{technique_yaml_file.stem}'."
+    )
+    assert (
+        len(technique.atomic_tests) > 0
+    ), f"{technique_yaml_file}: expected at least one atomic test."
+
+    for index, atomic_test in enumerate(technique.atomic_tests, start=1):
+        expected_test_number = f"{technique.attack_technique}-{index}"
+        assert atomic_test.test_number == expected_test_number, (
+            f"{technique_yaml_file}: bad test_number at index {index}; "
+            f"expected {expected_test_number}, got {atomic_test.test_number}."
+        )
